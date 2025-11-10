@@ -1,0 +1,13 @@
+{
+  "name": "sunshine-gateway",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "realtime-gateway.js",
+  "scripts": {
+    "start": "node realtime-gateway.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "ws": "^8.17.0"
+  }
+}
