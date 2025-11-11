@@ -41,11 +41,9 @@ wss.on('connection', (twilioWS, req) => {
   let saidHello = false;
   let conversationStarted = false;
 
-  // Audio buffer management - require more audio before processing
-  const MIN_FRAMES_FOR_COMMIT = 25; // ~500ms of audio minimum
-  let framesQueued = 0;
-  let bufferDirty = false;
+  // Audio buffer for VAD mode
   const audioQueue = [];
+  let frameCount = 0;
 
   // --- OpenAI Realtime Connection
   const OPENAI_RT_URL = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17';
@@ -58,7 +56,7 @@ wss.on('connection', (twilioWS, req) => {
 
   function cleanup() {
     try { clearInterval(keepAlive); } catch {}
-    try { clearInterval(flusher); } catch {}
+    try { clearInterval(audioSender); } catch {}
     try { oaiWS.close(); } catch {}
     try { twilioWS.close(); } catch {}
   }
@@ -103,33 +101,18 @@ wss.on('connection', (twilioWS, req) => {
     });
   };
 
-  // Commit audio buffer and request response
-  const tryCommitAndRespond = () => {
-    if (!sessionReady || inProgress || !conversationStarted) return;
-    if (!bufferDirty || framesQueued < MIN_FRAMES_FOR_COMMIT) return;
-
-    console.log('[AI] Processing', framesQueued, 'audio frames (~' + (framesQueued * 20) + 'ms)');
+  // With server VAD, we stream audio and OpenAI handles turn detection
+  const sendAudioToOpenAI = () => {
+    if (!sessionReady || !conversationStarted) return;
     
-    // Send all queued audio to OpenAI
-    while (audioQueue.length) {
+    while (audioQueue.length > 0) {
       const base64 = audioQueue.shift();
       safeSend({ type: 'input_audio_buffer.append', audio: base64 });
-      framesQueued--;
     }
-    
-    bufferDirty = false;
-    safeSend({ type: 'input_audio_buffer.commit' });
-    
-    // Request AI response
-    inProgress = true;
-    safeSend({ 
-      type: 'response.create', 
-      response: { modalities: ['text', 'audio'] } 
-    });
   };
 
-  // Check for audio to process every 300ms (gives more time for caller to speak)
-  const flusher = setInterval(tryCommitAndRespond, 300);
+  // Send audio continuously
+  const audioSender = setInterval(sendAudioToOpenAI, 100);
 
   // ===== OpenAI Event Handlers =====
   oaiWS.on('open', () => {
@@ -142,15 +125,32 @@ wss.on('connection', (twilioWS, req) => {
         input_audio_format: 'g711_ulaw',
         output_audio_format: 'g711_ulaw',
         
-        // Manual turn detection - AI waits for caller to finish speaking
-        turn_detection: null,
+        // Voice Activity Detection - AI listens and waits for caller to finish
+        turn_detection: {
+          type: 'server_vad',
+          threshold: 0.5,           // Sensitivity to voice
+          prefix_padding_ms: 300,   // Include 300ms before speech starts
+          silence_duration_ms: 1000 // Wait 1 full second of silence before responding
+        },
+        
+        // Voice configuration for softer, cheerier tone
+        voice: 'alloy',  // Alloy is warm and friendly
+        
+        temperature: 0.8,  // Slightly more expressive and natural
         
         input_audio_transcription: { 
           model: 'whisper-1' 
         },
         
         // ===== AI ASSISTANT INSTRUCTIONS WITH POOL KNOWLEDGE =====
-        instructions: `You are the AI receptionist for Sunshine Luxury Pools, an authorized Explore Industries dealer specializing in premium fiberglass pools.
+        instructions: `You are the friendly AI receptionist for Sunshine Luxury Pools, an authorized Explore Industries dealer specializing in premium fiberglass pools.
+
+YOUR PERSONALITY:
+- Warm, cheerful, and welcoming
+- Speak in a soft, friendly tone - like a helpful neighbor
+- Be upbeat and positive
+- Professional but not stiff or robotic
+- Make callers feel comfortable and valued
 
 YOUR ROLE:
 - Answer questions about luxury fiberglass pools professionally and warmly
@@ -338,8 +338,6 @@ Remember:
       inProgress = false;
       conversationStarted = true;
       console.log('[OpenAI] Response complete');
-      // Process any buffered caller audio
-      setTimeout(tryCommitAndRespond, 100);
     }
 
     // Stream audio back to Twilio
@@ -374,7 +372,6 @@ Remember:
   });
 
   // ===== Twilio Event Handlers =====
-  let frameCount = 0;
   
   twilioWS.on('message', (buf) => {
     let data;
@@ -387,11 +384,9 @@ Remember:
     }
 
     if (data.event === 'media' && data.media?.payload) {
-      // Only queue audio after initial greeting
+      // Queue audio for sending to OpenAI
       if (conversationStarted) {
         audioQueue.push(data.media.payload);
-        framesQueued++;
-        bufferDirty = true;
         frameCount++;
         
         if (frameCount % 100 === 0) {
