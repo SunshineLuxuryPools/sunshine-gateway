@@ -1,4 +1,4 @@
-// sunshine-gateway / server.js (echo test + TwiML webhook)
+// sunshine-gateway / server.js (TwiML webhook + WS stream + loud logs)
 require('dotenv').config();
 const http = require('http');
 const express = require('express');
@@ -6,68 +6,51 @@ const { WebSocketServer } = require('ws');
 
 const app = express();
 app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
 
-// HTTP logging + health
+// Loud HTTP logging
 app.use((req, _res, next) => { console.log('[HTTP]', req.method, req.url); next(); });
+
+// Health + root
 app.get('/health', (_, res) => res.status(200).send('ok'));
 app.get('/',     (_, res) => res.status(200).send('sunshine-gateway up'));
 
-// TwiML webhook for inbound calls
-app.post('/twiml', (req, res) => {
-  console.log('[HTTP] POST /twiml');
-  res.type('text/xml').send(`
-    <Response>
-      <Say voice="alice">Good evening, Sunshine. Connecting you now.</Say>
-      <Connect>
-        <Stream url="wss://sunshine-gateway.onrender.com/stream"/>
-      </Connect>
-    </Response>
-  `.trim());
-});
+// TwiML webhook (GET for browser test, POST for Twilio)
+const twimlXml = `
+<Response>
+  <Say voice="alice">Good evening, Sunshine. Connecting you now.</Say>
+  <Connect><Stream url="wss://sunshine-gateway.onrender.com/stream"/></Connect>
+</Response>
+`.trim();
 
+app.get('/twiml',  (_req, res) => { console.log('[TwiML] GET /twiml');  res.type('text/xml').send(twimlXml); });
+app.post('/twiml', (_req, res) => { console.log('[TwiML] POST /twiml'); res.type('text/xml').send(twimlXml); });
+
+// HTTP server + WS upgrade logging
 const server = http.createServer(app);
 server.on('upgrade', (req) => { console.log('[UPGRADE] request for', req.url); });
 
-// WS endpoint for Twilio <Stream>
+// WebSocket endpoint for Twilio <Stream>
 const wss = new WebSocketServer({ server, path: '/stream' });
 
 wss.on('connection', (ws, req) => {
   console.log('[Twilio] WS connected from', req.socket.remoteAddress);
+  let streamSid = null;
 
-  let streamSid = null; // capture on "start"
-
-  // keep-alive
   const iv = setInterval(() => { try { ws.ping(); } catch {} }, 25000);
 
   ws.on('message', (msg) => {
-    let d;
-    try { d = JSON.parse(msg.toString()); } catch { return; }
-
+    let d; try { d = JSON.parse(msg.toString()); } catch { return; }
     if (d.event === 'start') {
       streamSid = d.start?.streamSid || null;
       console.log('[Twilio] start callSid=', d.start?.callSid, 'streamSid=', streamSid);
-      return;
-    }
-
-    if (d.event === 'media') {
-      // Echo the caller audio back to them (μ-law 8k base64)
-      if (streamSid && d.media?.payload) {
-        const out = {
-          event: 'media',
-          streamSid,
-          media: { payload: d.media.payload }
-        };
-        try { ws.send(JSON.stringify(out)); } catch {}
-      }
-      return;
-    }
-
-    if (d.event === 'stop') {
+    } else if (d.event === 'media') {
+      console.log('[Twilio] media packet received');
+    } else if (d.event === 'stop') {
       console.log('[Twilio] stop');
-      return;
+    } else {
+      console.log('[Twilio] event:', d.event || '(unknown)');
     }
-
-    console.log('[Twilio] event:', d.event || '(unknown)');
   });
 
   ws.on('close', () => { clearInterval(iv); console.log('[Twilio] WS closed'); });
@@ -76,6 +59,6 @@ wss.on('connection', (ws, req) => {
 const port = process.env.PORT || 8080;
 server.listen(port, () => console.log('Gateway listening on :' + port));
 
-// graceful shutdown
+// Graceful shutdown
 process.on('SIGTERM', () => { try { server.close(() => process.exit(0)); } catch { process.exit(0); } });
 process.on('SIGINT',  () => { try { server.close(() => process.exit(0)); } catch { process.exit(0); } });
