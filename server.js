@@ -18,7 +18,6 @@ app.get('/', (_req, res) => res.status(200).send('sunshine-gateway up'));
 // --- TwiML webhook (point your Twilio number here as Webhook POST)
 const twimlXml = `
 <Response>
-  <Say voice="alice">Good morning, Sunshine. Connecting you now.</Say>
   <Connect><Stream url="wss://sunshine-gateway.onrender.com/stream"/></Connect>
 </Response>
 `.trim();
@@ -39,15 +38,16 @@ wss.on('connection', (twilioWS, req) => {
   let sessionReady = false;
   let inProgress = false;         // true while OpenAI is generating/playing
   let saidHello = false;
+  let conversationStarted = false;
 
   // Audio queue
   const MIN_FRAMES_FOR_COMMIT = 10; // 10*~20ms = ~200ms
   let framesQueued = 0;
-  let bufferDirty = false;         // becomes true when at least one frame appended
+  let bufferDirty = false;
   const audioQueue = [];
 
   // --- Connect to OpenAI Realtime
-  const OPENAI_RT_URL = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12';
+  const OPENAI_RT_URL = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17';
   const oaiWS = new ClientWS(OPENAI_RT_URL, {
     headers: {
       Authorization: `Bearer ${process.env.OPENAI_API_KEY || ''}`,
@@ -69,31 +69,61 @@ wss.on('connection', (twilioWS, req) => {
   }, 20000);
 
   const safeSend = (obj) => {
-    if (oaiWS.readyState !== 1) return false; // 1 = OPEN
+    if (oaiWS.readyState !== 1) return false;
     try { oaiWS.send(JSON.stringify(obj)); return true; } catch { return false; }
   };
 
-  // Commit & ask for response only when:
-  // - session ready
-  // - not inProgress
-  // - enough frames buffered
-  // - AND we actually appended frames since last commit (bufferDirty)
+  // Send initial greeting WITHOUT committing audio buffer
+  const sendInitialGreeting = () => {
+    if (saidHello || !sessionReady) return;
+    saidHello = true;
+    inProgress = true;
+    
+    console.log('[Bridge] Sending initial greeting');
+    // Use conversation.item.create to add assistant message directly
+    safeSend({
+      type: 'conversation.item.create',
+      item: {
+        type: 'message',
+        role: 'assistant',
+        content: [
+          {
+            type: 'input_text',
+            text: 'Good evening, Sunshine Pools and Construction. How can I help you today?'
+          }
+        ]
+      }
+    });
+    
+    // Then create response to generate the audio
+    safeSend({ 
+      type: 'response.create',
+      response: { modalities: ['audio'] }
+    });
+  };
+
+  // Commit & ask for response only when appropriate
   const tryCommitAndRespond = () => {
     if (!sessionReady || inProgress) return;
     if (!bufferDirty || framesQueued < MIN_FRAMES_FOR_COMMIT) return;
 
     console.log('[Bridge] committing', framesQueued, 'frames (~', framesQueued * 20, 'ms)');
+    
+    // Send all queued audio
     while (audioQueue.length) {
       const base64 = audioQueue.shift();
       safeSend({ type: 'input_audio_buffer.append', audio: base64 });
       framesQueued--;
     }
-    bufferDirty = false; // reset; nothing pending now
+    
+    bufferDirty = false;
+    
+    // Commit the buffer
     safeSend({ type: 'input_audio_buffer.commit' });
-
-    // Now request a multimodal response
+    
+    // Request response
     inProgress = true;
-    safeSend({ type: 'response.create', response: { modalities: ['text','audio'] } });
+    safeSend({ type: 'response.create', response: { modalities: ['text', 'audio'] } });
   };
 
   const flusher = setInterval(tryCommitAndRespond, 150);
@@ -106,97 +136,140 @@ wss.on('connection', (twilioWS, req) => {
       session: {
         input_audio_format:  'g711_ulaw',
         output_audio_format: 'g711_ulaw',
-        instructions:
-          "You are Sunshine’s friendly AI receptionist for pools & construction. Be brief, warm, and professional. Collect name, callback number, and reason for calling; offer to book a consultation."
+        turn_detection: null,  // Server-controlled turn detection
+        input_audio_transcription: { model: 'whisper-1' },
+        instructions: `You are Sunshine Pools and Construction's friendly AI receptionist. 
+
+Be brief, warm, and professional. Your job is to:
+1. Greet callers warmly
+2. Listen to their needs
+3. Collect their name, callback number, and reason for calling
+4. Offer to book a consultation if appropriate
+5. Thank them for calling
+
+Keep responses concise and natural. Don't overwhelm with too much information at once.`
       }
     });
   });
 
   oaiWS.on('message', (msg) => {
-    let evt; try { evt = JSON.parse(msg.toString()); } catch { return; }
+    let evt; 
+    try { evt = JSON.parse(msg.toString()); } catch { return; }
 
-    // Log non-stream events to see lifecycle
-    if (evt.type && evt.type !== 'response.output_audio.delta') {
+    // Log non-stream events
+    if (evt.type && evt.type !== 'response.audio.delta' && evt.type !== 'response.output_audio.delta') {
       console.log('[OpenAI EVT]', evt.type);
     }
 
     if (evt.type === 'session.updated') {
       sessionReady = true;
       console.log('[OpenAI] session confirmed');
-      if (!saidHello) {
-        saidHello = true;
-        // initial greeting (does not depend on caller audio)
-        inProgress = true; // will clear on created/completed/done events below
-        safeSend({
-          type: 'response.create',
-          response: { modalities: ['text','audio'], instructions: "Hi there! Thanks for calling Sunshine. How can I help today?" }
-        });
-      }
+      // Send greeting once session is ready
+      sendInitialGreeting();
     }
 
-    // Track response lifecycle to prevent overlaps
+    if (evt.type === 'session.created') {
+      console.log('[OpenAI] session created');
+    }
+
+    // Track response lifecycle
     if (evt.type === 'response.created') {
       inProgress = true;
+      console.log('[OpenAI] response started');
     }
-    if (evt.type === 'response.output_audio.done' || evt.type === 'response.completed' || evt.type === 'response.done') {
+
+    if (evt.type === 'response.done') {
       inProgress = false;
-      // after finishing, if we have buffered caller audio, process it
+      console.log('[OpenAI] response completed');
+      conversationStarted = true;
+      // Check if we have buffered audio to process
       tryCommitAndRespond();
     }
 
-    // Forward audio chunks back to Twilio
-    if (evt.type === 'response.output_audio.delta' && evt.audio && streamSid) {
-      const pkt = { event: 'media', streamSid, media: { payload: evt.audio } };
-      try { twilioWS.send(JSON.stringify(pkt)); } catch {}
+    // Handle audio deltas (both field names for compatibility)
+    if ((evt.type === 'response.audio.delta' || evt.type === 'response.output_audio.delta') && streamSid) {
+      const audioData = evt.delta || evt.audio;
+      if (audioData) {
+        const pkt = { 
+          event: 'media', 
+          streamSid, 
+          media: { payload: audioData } 
+        };
+        try { twilioWS.send(JSON.stringify(pkt)); } catch(e) {
+          console.error('[Twilio] Error sending audio:', e.message);
+        }
+      }
     }
 
     if (evt.type === 'error') {
-      console.error('[OpenAI ERROR]', evt);
-      // if we errored while "busy", unblock so next commit can request a response
+      console.error('[OpenAI ERROR]', JSON.stringify(evt, null, 2));
       inProgress = false;
     }
   });
 
-  oaiWS.on('error', (e) => console.error('[OpenAI] error', e?.message));
-  oaiWS.on('close', () => console.log('[OpenAI] closed'));
+  oaiWS.on('error', (e) => {
+    console.error('[OpenAI] WebSocket error:', e?.message);
+  });
+  
+  oaiWS.on('close', (code, reason) => {
+    console.log('[OpenAI] closed. Code:', code, 'Reason:', reason?.toString());
+  });
 
   // ---- Twilio → OpenAI
   let frameCountLog = 0;
   twilioWS.on('message', (buf) => {
-    let data; try { data = JSON.parse(buf.toString()); } catch { return; }
+    let data; 
+    try { data = JSON.parse(buf.toString()); } catch { return; }
 
     if (data.event === 'start') {
       streamSid = data.start?.streamSid || null;
-      console.log('[Twilio] start', streamSid);
+      console.log('[Twilio] Stream started. SID:', streamSid);
       return;
     }
 
     if (data.event === 'media' && data.media?.payload) {
-      audioQueue.push(data.media.payload);
-      framesQueued++;
-      bufferDirty = true;
-      frameCountLog++;
-      if (frameCountLog % 25 === 0) console.log('[Twilio] media frames queued:', frameCountLog);
+      // Only queue audio after conversation has started
+      if (conversationStarted) {
+        audioQueue.push(data.media.payload);
+        framesQueued++;
+        bufferDirty = true;
+        frameCountLog++;
+        if (frameCountLog % 50 === 0) {
+          console.log('[Twilio] Total media frames received:', frameCountLog);
+        }
+      }
       return;
     }
 
     if (data.event === 'stop') {
-      console.log('[Twilio] stop');
-      // Optional sign-off if idle
-      if (!inProgress) {
+      console.log('[Twilio] Stream stopped');
+      // Send goodbye if appropriate
+      if (!inProgress && conversationStarted) {
         inProgress = true;
         safeSend({
-          type: 'response.create',
-          response: { modalities: ['text','audio'], instructions: "Thanks for calling Sunshine. We'll follow up shortly. Goodbye!" }
+          type: 'conversation.item.create',
+          item: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'input_text', text: 'Thanks for calling Sunshine. Have a great day!' }]
+          }
         });
+        safeSend({ type: 'response.create', response: { modalities: ['audio'] } });
       }
       return;
     }
   });
 
-  twilioWS.on('close', () => { console.log('[Twilio] WS closed'); cleanup(); });
-  twilioWS.on('error', cleanup);
+  twilioWS.on('close', () => { 
+    console.log('[Twilio] WebSocket closed'); 
+    cleanup(); 
+  });
+  
+  twilioWS.on('error', (e) => {
+    console.error('[Twilio] WebSocket error:', e?.message);
+    cleanup();
+  });
 });
 
 const port = process.env.PORT || 8080;
-server.listen(port, () => console.log('Gateway listening on :' + port));
+server.listen(port, () => console.log('🌞 Sunshine Gateway listening on port ' + port));
