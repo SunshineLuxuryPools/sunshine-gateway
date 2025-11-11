@@ -1,5 +1,6 @@
 // sunshine-gateway / server.js
-// Adds explicit session confirmation before greeting + stronger keepalive.
+// Twilio <Stream> ↔ OpenAI Realtime bridge with g711_ulaw,
+// session confirmation, ≥200ms buffering, and overlap guards.
 
 require('dotenv').config();
 const http = require('http');
@@ -24,13 +25,15 @@ app.get('/twiml', (_req, res) => res.type('text/xml').send(twimlXml));
 app.post('/twiml', (_req, res) => res.type('text/xml').send(twimlXml));
 
 const server = http.createServer(app);
+server.on('upgrade', (req) => console.log('[UPGRADE] request for', req.url));
+
 const wss = new WebSocketServer({ server, path: '/stream' });
 
 wss.on('connection', (twilioWS, req) => {
   console.log('[Twilio] WS connected from', req.socket.remoteAddress);
+
   let streamSid = null;
   let sessionReady = false;
-  let openaiReady = false;
   let inProgress = false;
   let saidHello = false;
   let framesQueued = 0;
@@ -44,34 +47,45 @@ wss.on('connection', (twilioWS, req) => {
     }
   });
 
-  const safeSend = (obj) => {
-    if (oaiWS.readyState !== 1) return;
-    oaiWS.send(JSON.stringify(obj));
-  };
+  // --- define cleanup BEFORE any use (function declaration is hoisted) ---
+  function cleanup() {
+    try { clearInterval(keepAlive); } catch {}
+    try { clearInterval(flusher); } catch {}
+    try { oaiWS.close(); } catch {}
+    try { twilioWS.close(); } catch {}
+  }
 
   const keepAlive = setInterval(() => {
     try { oaiWS.ping(); } catch {}
     try { twilioWS.ping(); } catch {}
   }, 20000);
 
+  const MIN_FRAMES_FOR_COMMIT = 10; // ~200ms (10 * 20ms frames)
+
+  const safeSend = (obj) => {
+    if (oaiWS.readyState !== 1) return;
+    oaiWS.send(JSON.stringify(obj));
+  };
+
   const drainQueueAndRespond = () => {
     if (!sessionReady || inProgress) return;
-    if (framesQueued < 10) return; // ~200ms
+    if (framesQueued < MIN_FRAMES_FOR_COMMIT) return;
 
+    console.log('[Bridge] committing', framesQueued, 'frames (~', framesQueued * 20, 'ms)');
     while (audioQueue.length) {
       safeSend({ type: 'input_audio_buffer.append', audio: audioQueue.shift() });
       framesQueued--;
     }
     safeSend({ type: 'input_audio_buffer.commit' });
     inProgress = true;
-    safeSend({ type: 'response.create', response: { modalities: ['text', 'audio'] } });
+    safeSend({ type: 'response.create', response: { modalities: ['text','audio'] } });
   };
+
   const flusher = setInterval(drainQueueAndRespond, 150);
 
+  // ----- OpenAI events -----
   oaiWS.on('open', () => {
     console.log('[OpenAI] connected');
-    openaiReady = true;
-    // Send session update
     safeSend({
       type: 'session.update',
       session: {
@@ -94,7 +108,7 @@ wss.on('connection', (twilioWS, req) => {
         console.log('[OpenAI] sending hello');
         safeSend({
           type: 'response.create',
-          response: { modalities: ['text', 'audio'], instructions: "Hi there! Thanks for calling Sunshine. How can I help today?" }
+          response: { modalities: ['text','audio'], instructions: "Hi there! Thanks for calling Sunshine. How can I help today?" }
         });
       }
     }
@@ -107,46 +121,47 @@ wss.on('connection', (twilioWS, req) => {
       try { twilioWS.send(JSON.stringify(pkt)); } catch {}
     }
 
-    if (evt.type !== 'response.output_audio.delta') {
-      console.log('[OpenAI EVT]', evt.type);
-    }
-
+    if (evt.type !== 'response.output_audio.delta') console.log('[OpenAI EVT]', evt.type);
     if (evt.type === 'error') console.error('[OpenAI ERROR]', evt);
   });
 
   oaiWS.on('error', (e) => console.error('[OpenAI] error', e?.message));
   oaiWS.on('close', () => console.log('[OpenAI] closed'));
 
+  // ----- Twilio -> OpenAI -----
+  let frameCountLog = 0;
   twilioWS.on('message', (buf) => {
     let data; try { data = JSON.parse(buf.toString()); } catch { return; }
+
     if (data.event === 'start') {
       streamSid = data.start?.streamSid;
       console.log('[Twilio] start', streamSid);
       return;
     }
+
     if (data.event === 'media' && data.media?.payload) {
       audioQueue.push(data.media.payload);
       framesQueued++;
-      if (framesQueued % 25 === 0) console.log('[Twilio] framesQueued:', framesQueued);
+      frameCountLog++;
+      if (frameCountLog % 25 === 0) console.log('[Twilio] media frames queued:', frameCountLog);
+      return;
     }
+
     if (data.event === 'stop') {
       console.log('[Twilio] stop');
-      safeSend({
-        type: 'response.create',
-        response: { modalities: ['text','audio'], instructions: "Thanks for calling Sunshine. Goodbye!" }
-      });
+      if (!inProgress) {
+        inProgress = true;
+        safeSend({
+          type: 'response.create',
+          response: { modalities: ['text','audio'], instructions: "Thanks for calling Sunshine. Goodbye!" }
+        });
+      }
+      return;
     }
   });
 
   twilioWS.on('close', () => { console.log('[Twilio] WS closed'); cleanup(); });
   twilioWS.on('error', cleanup);
-
-  const cleanup = () => {
-    clearInterval(keepAlive);
-    clearInterval(flusher);
-    try { oaiWS.close(); } catch {}
-    try { twilioWS.close(); } catch {}
-  };
 });
 
 const port = process.env.PORT || 8080;
