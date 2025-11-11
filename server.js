@@ -197,8 +197,6 @@ Remember: You're having a conversation, not reading a script. Be real.`
       }
     });
   });
-    }
-  });
 
   twilioWS.on('close', () => {
     console.log('[Twilio] Connection closed');
