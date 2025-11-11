@@ -1,7 +1,6 @@
-// sunshine-gateway / server.js
-// Enhanced AI Phone Assistant for Luxury Pools
-
+// server.js - Sunshine Luxury Pools AI Assistant
 require('dotenv').config();
+const config = require('./config');
 const http = require('http');
 const express = require('express');
 const { WebSocketServer, WebSocket: ClientWS } = require('ws');
@@ -9,46 +8,81 @@ const { WebSocketServer, WebSocket: ClientWS } = require('ws');
 const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
-
 app.use((req, _res, next) => { console.log('[HTTP]', req.method, req.url); next(); });
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 app.get('/', (_req, res) => res.status(200).send('Sunshine Luxury Pools AI Assistant'));
 
-// --- TwiML webhook
+// Generate TwiML from config
 const twimlXml = `
 <Response>
-  <Say voice="Polly.Joanna">Good evening, <break time="300ms"/> SUNSHINE. <break time="500ms"/> Emma speaking. How may I assist you today?</Say>
+  <Say voice="Polly.Joanna">${config.greeting}</Say>
   <Pause length="1"/>
   <Connect><Stream url="wss://sunshine-gateway.onrender.com/stream"/></Connect>
 </Response>
 `.trim();
+
 app.get('/twiml', (_req, res) => res.type('text/xml').send(twimlXml));
 app.post('/twiml', (_req, res) => res.type('text/xml').send(twimlXml));
 
 const server = http.createServer(app);
-server.on('upgrade', (req) => console.log('[UPGRADE]', req.url));
-
-// --- Twilio <Stream> endpoint
 const wss = new WebSocketServer({ server, path: '/stream' });
 
+// Build AI instructions from config
+function buildInstructions() {
+  const examples = config.conversationExamples
+    .map(ex => `Caller: "${ex.caller}"\nEmma: "${ex.emma}"`)
+    .join('\n\n');
+  
+  const quickInfo = Object.entries(config.quickInfo)
+    .map(([key, val]) => `${key}: ${val}`)
+    .join('\n');
+  
+  return `You're Emma at ${config.company.name}.
+
+GREETING ALREADY SAID: "${config.greeting}"
+Don't repeat it. React to what the CALLER says.
+
+PERSONALITY:
+${config.personality.join('\n')}
+
+COMPANY: ${config.company.name} - ${config.company.locations.join(' & ')}
+Website: ${config.company.website}
+Financing: ${config.company.financing}
+
+QUICK FACTS:
+${quickInfo}
+
+===== LEARN FROM THESE EXAMPLES =====
+${examples}
+
+===== YOUR JOB =====
+- Answer questions naturally and briefly (1-2 sentences)
+- Collect: name, phone, what they need
+- Offer free consultations for detailed quotes
+- If you don't know: "Let me get a specialist to call you back"
+- Keep it real, not robotic
+
+Be helpful, warm, brief.`;
+}
+
 wss.on('connection', (twilioWS, req) => {
-  console.log('[Twilio] WS connected from', req.socket.remoteAddress);
+  console.log('[Twilio] Connected from', req.socket.remoteAddress);
 
   let streamSid = null;
   let sessionReady = false;
-  let inProgress = false;
   let conversationStarted = false;
-
   const audioQueue = [];
   let frameCount = 0;
 
-  const OPENAI_RT_URL = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17';
-  const oaiWS = new ClientWS(OPENAI_RT_URL, {
-    headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY || ''}`,
-      'OpenAI-Beta': 'realtime=v1'
+  const oaiWS = new ClientWS(
+    'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17',
+    {
+      headers: {
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+        'OpenAI-Beta': 'realtime=v1'
+      }
     }
-  });
+  );
 
   function cleanup() {
     try { clearInterval(keepAlive); } catch {}
@@ -58,30 +92,21 @@ wss.on('connection', (twilioWS, req) => {
   }
 
   const keepAlive = setInterval(() => {
-    try { oaiWS.ping(); } catch {}
-    try { twilioWS.ping(); } catch {}
+    try { oaiWS.ping(); twilioWS.ping(); } catch {}
   }, 25000);
 
   const safeSend = (obj) => {
-    if (oaiWS.readyState !== 1) return false;
-    try { 
-      oaiWS.send(JSON.stringify(obj)); 
-      return true; 
-    } catch { 
-      return false; 
+    if (oaiWS.readyState === 1) {
+      try { 
+        oaiWS.send(JSON.stringify(obj)); 
+        return true; 
+      } catch {}
     }
-  };
-
-  const startConversation = () => {
-    if (conversationStarted || !sessionReady) return;
-    conversationStarted = true;
-    console.log('[AI] Ready to listen to caller');
+    return false;
   };
 
   const sendAudioToOpenAI = () => {
-    if (!sessionReady || !conversationStarted) return;
-    
-    while (audioQueue.length > 0) {
+    if (sessionReady && conversationStarted && audioQueue.length > 0) {
       const base64 = audioQueue.shift();
       safeSend({ type: 'input_audio_buffer.append', audio: base64 });
     }
@@ -102,89 +127,16 @@ wss.on('connection', (twilioWS, req) => {
           type: 'server_vad',
           threshold: 0.5,
           prefix_padding_ms: 300,
-          silence_duration_ms: 600
+          silence_duration_ms: config.silenceDuration
         },
         
-        voice: 'shimmer',
-        temperature: 0.9,
-        max_response_output_tokens: 150,
+        voice: config.voice,
+        temperature: config.temperature,
+        max_response_output_tokens: config.maxTokens,
         
-        input_audio_transcription: { 
-          model: 'whisper-1' 
-        },
+        input_audio_transcription: { model: 'whisper-1' },
         
-        instructions: `You're Emma, the receptionist at Sunshine Luxury Pools. 
-
-IMPORTANT: The caller has ALREADY been greeted with "Good evening, SUNSHINE. Emma speaking. How may I assist you today?"
-
-Your first response should react to what the CALLER says, not repeat the greeting.
-
-Talk like a real person - natural, warm, conversational.
-
-BE NATURAL:
-- Use contractions (I'm, we're, that's, you'll)
-- Vary your phrasing - don't sound rehearsed
-- Be brief and to the point
-- Sound genuinely interested in helping
-- If interrupted, adapt quickly to the new topic
-
-PERSONALITY:
-Imagine you're a friendly neighbor who happens to work at a pool company. Warm, helpful, but not overly formal.
-
-===== COMPANY INFO =====
-Sunshine Luxury Pools - Cape Coral & Punta Gorda, FL
-We install EVO fiberglass pools (made by Explore Manufacturing)
-Installation: 2-3 weeks vs 3-6 months for concrete
-Website: sunshineluxurypools.com
-Financing: Available through Vista Fi
-
-===== HOW TO HANDLE CALLS =====
-
-**They ask about a coupon:**
-"Oh great! What's the coupon for? I'll grab your name and number so we can get you those details."
-
-**General pool interest:**
-"Awesome! Are you thinking about putting in a pool at your place?"
-Then ask what they're looking for, get name/number for a consultation.
-
-**How long does it take:**
-"Our fiberglass pools go in super fast - usually 2 to 3 weeks after permits. Way quicker than concrete."
-
-**How much:**
-"It really depends on the size and what features you want. We do free consultations where we can give you an exact quote. Can I grab your info?"
-
-**Why fiberglass:**
-"They're built in a factory so they're super consistent and strong. Plus you never have to resurface them like concrete. And installation's way faster."
-
-**Can I customize it:**
-"Totally! Built-in benches, tanning ledges, spas, custom lighting - lots of options. We customize everything."
-
-**Financing:**
-"Yeah, we work with Vista Fi - pretty flexible terms. I can have someone call you with all the financing options."
-
-**Wants to schedule:**
-Get: name, phone, what they're interested in, preferred time
-Say: "Perfect, I'm getting that scheduled. You'll get a text confirmation with the details."
-
-===== KEY POINTS =====
-- Keep answers SHORT (1-2 sentences usually)
-- Sound natural, not scripted
-- If you don't know something: "Let me have a specialist call you back with that info"
-- Always try to get: name, phone number
-- Be helpful, not pushy
-
-===== EXAMPLES OF NATURAL FLOW =====
-
-Them: "I got something in the mail about pools"
-You: "Oh nice! Was it about a specific promotion or just general info?"
-
-Them: "How much for a medium pool?"
-You: "So it varies a lot based on what you want, but we can give you an exact quote in a free consultation. What's your name?"
-
-Them: "Do you do concrete pools?"
-You: "We actually specialize in fiberglass - they install way faster and never need resurfacing. Want to hear more about those?"
-
-Remember: You're having a conversation, not reading a script. Be real.`
+        instructions: buildInstructions()
       }
     });
   });
@@ -193,29 +145,18 @@ Remember: You're having a conversation, not reading a script. Be real.`
     let evt;
     try { evt = JSON.parse(msg.toString()); } catch { return; }
 
-    if (evt.type && 
-        evt.type !== 'response.audio.delta' && 
-        evt.type !== 'response.output_audio.delta' &&
-        evt.type !== 'input_audio_buffer.speech_started' &&
-        evt.type !== 'input_audio_buffer.speech_stopped') {
+    // Log key events only
+    if (evt.type && !evt.type.includes('audio') && !evt.type.includes('speech')) {
       console.log('[OpenAI]', evt.type);
     }
 
     if (evt.type === 'session.updated' || evt.type === 'session.created') {
       sessionReady = true;
-      console.log('[OpenAI] Session ready');
-      startConversation();
+      conversationStarted = true;
+      console.log('[AI] Ready - Voice:', config.voice);
     }
 
-    if (evt.type === 'response.created') {
-      inProgress = true;
-    }
-
-    if (evt.type === 'response.done') {
-      inProgress = false;
-      console.log('[OpenAI] Response complete');
-    }
-
+    // Stream audio back to caller
     if ((evt.type === 'response.audio.delta' || evt.type === 'response.output_audio.delta') && streamSid) {
       const audioData = evt.delta || evt.audio;
       if (audioData) {
@@ -226,69 +167,57 @@ Remember: You're having a conversation, not reading a script. Be real.`
             media: { payload: audioData }
           }));
         } catch (e) {
-          console.error('[Twilio] Send error:', e.message);
+          console.error('[Twilio] Audio send error:', e.message);
         }
       }
     }
 
     if (evt.type === 'error') {
-      console.error('[OpenAI ERROR]', JSON.stringify(evt.error, null, 2));
-      inProgress = false;
+      console.error('[OpenAI ERROR]', evt.error?.message || evt);
     }
   });
 
-  oaiWS.on('error', (e) => {
-    console.error('[OpenAI] Connection error:', e?.message);
-  });
-
-  oaiWS.on('close', (code, reason) => {
-    console.log('[OpenAI] Disconnected. Code:', code);
-  });
+  oaiWS.on('error', (e) => console.error('[OpenAI] Error:', e?.message));
+  oaiWS.on('close', () => console.log('[OpenAI] Closed'));
 
   twilioWS.on('message', (buf) => {
     let data;
     try { data = JSON.parse(buf.toString()); } catch { return; }
 
     if (data.event === 'start') {
-      streamSid = data.start?.streamSid || null;
-      console.log('[Twilio] Call started. Stream SID:', streamSid);
-      return;
+      streamSid = data.start?.streamSid;
+      console.log('[Twilio] Stream started:', streamSid);
     }
 
-    if (data.event === 'media' && data.media?.payload) {
-      if (conversationStarted) {
-        audioQueue.push(data.media.payload);
-        frameCount++;
-        
-        if (frameCount % 100 === 0) {
-          console.log('[Twilio] Audio frames received:', frameCount);
-        }
-      }
-      return;
+    if (data.event === 'media' && data.media?.payload && conversationStarted) {
+      audioQueue.push(data.media.payload);
+      frameCount++;
+      if (frameCount % 100 === 0) console.log('[Audio] Frames:', frameCount);
     }
 
     if (data.event === 'stop') {
-      console.log('[Twilio] Call ended');
+      console.log('[Twilio] Stream stopped');
       setTimeout(cleanup, 1000);
-      return;
     }
   });
 
   twilioWS.on('close', () => {
-    console.log('[Twilio] Connection closed');
+    console.log('[Twilio] Closed');
     cleanup();
   });
 
   twilioWS.on('error', (e) => {
-    console.error('[Twilio] Connection error:', e?.message);
+    console.error('[Twilio] Error:', e?.message);
     cleanup();
   });
 });
 
 const port = process.env.PORT || 8080;
 server.listen(port, () => {
-  console.log('==============================================');
-  console.log('🌞 Sunshine Luxury Pools - Emma AI');
-  console.log(`📞 Listening on port ${port}`);
-  console.log('==============================================');
+  console.log('╔════════════════════════════════════════╗');
+  console.log('║  🌞 Sunshine Luxury Pools AI          ║');
+  console.log(`║  📞 Port: ${port.toString().padEnd(28)} ║`);
+  console.log(`║  🎤 Voice: ${config.voice.padEnd(26)} ║`);
+  console.log(`║  🧠 Temp: ${config.temperature.toString().padEnd(27)} ║`);
+  console.log('╚════════════════════════════════════════╝');
 });
