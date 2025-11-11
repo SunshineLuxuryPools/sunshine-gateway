@@ -1,5 +1,5 @@
 // sunshine-gateway / server.js
-// Twilio <Stream> ↔ OpenAI Realtime (g711_ulaw). Robust queueing & overlap guards.
+// Twilio <Stream> ↔ OpenAI Realtime (g711_ulaw) with VAD turn-taking, strict commit guards, short replies.
 
 require('dotenv').config();
 const http = require('http');
@@ -36,14 +36,16 @@ wss.on('connection', (twilioWS, req) => {
   // State
   let streamSid = null;
   let sessionReady = false;
-  let inProgress = false;         // true while OpenAI is generating/playing
+  let inProgress = false;             // true only while OpenAI is producing audio
   let saidHello = false;
   let conversationStarted = false;
 
   // Audio queue
-  const MIN_FRAMES_FOR_COMMIT = 10; // 10*~20ms = ~200ms
+  const MIN_FRAMES_FOR_COMMIT = 10;   // ≈ 200ms (10 x ~20ms frames)
+  const MIN_SILENCE_MS = 450;         // wait since last caller audio before commit
   let framesQueued = 0;
   let bufferDirty = false;
+  let lastMediaAt = 0;
   const audioQueue = [];
 
   // --- Connect to OpenAI Realtime
@@ -77,53 +79,45 @@ wss.on('connection', (twilioWS, req) => {
   const sendInitialGreeting = () => {
     if (saidHello || !sessionReady) return;
     saidHello = true;
-    inProgress = true;
-    
+
     console.log('[Bridge] Sending initial greeting');
-    // Use conversation.item.create to add assistant message directly
+    // Add assistant message to conversation…
     safeSend({
       type: 'conversation.item.create',
       item: {
         type: 'message',
         role: 'assistant',
-        content: [
-          {
-            type: 'input_text',
-            text: 'Good evening, Sunshine Pools and Construction. How can I help you today?'
-          }
-        ]
+        content: [{ type: 'input_text', text: 'Hi! Thanks for calling Sunshine. How can I help today?' }]
       }
     });
-    
-    // Then create response to generate the audio
-    safeSend({ 
-      type: 'response.create',
-      response: { modalities: ['audio', 'text'] }
-    });
+    // …then render it as audio
+    safeSend({ type: 'response.create', response: { modalities: ['text','audio'] } });
   };
 
   // Commit & ask for response only when appropriate
   const tryCommitAndRespond = () => {
     if (!sessionReady || inProgress) return;
     if (!bufferDirty || framesQueued < MIN_FRAMES_FOR_COMMIT) return;
+    if (audioQueue.length === 0) return;
 
-    console.log('[Bridge] committing', framesQueued, 'frames (~', framesQueued * 20, 'ms)');
-    
+    const now = Date.now();
+    if (now - lastMediaAt < MIN_SILENCE_MS) return;  // wait for caller to finish
+
+    console.log('[Bridge] committing', framesQueued, 'frames (~', framesQueued * 20, 'ms), queueLen=', audioQueue.length);
+
     // Send all queued audio
     while (audioQueue.length) {
       const base64 = audioQueue.shift();
       safeSend({ type: 'input_audio_buffer.append', audio: base64 });
       framesQueued--;
     }
-    
     bufferDirty = false;
-    
+
     // Commit the buffer
     safeSend({ type: 'input_audio_buffer.commit' });
-    
-    // Request response
-    inProgress = true;
-    safeSend({ type: 'response.create', response: { modalities: ['text', 'audio'] } });
+
+    // Request response AFTER a real commit (inProgress flips true on response.created)
+    safeSend({ type: 'response.create', response: { modalities: ['text','audio'] } });
   };
 
   const flusher = setInterval(tryCommitAndRespond, 150);
@@ -136,18 +130,24 @@ wss.on('connection', (twilioWS, req) => {
       session: {
         input_audio_format:  'g711_ulaw',
         output_audio_format: 'g711_ulaw',
-        turn_detection: null,  // Server-controlled turn detection
+        voice: 'alloy', // try 'verse' or 'aria' if you prefer
+        // Server-side turn taking (no monologues, wait after a question)
+        turn_detection: {
+          type: 'server',
+          threshold: 0.5,
+          silence_duration_ms: 600
+        },
         input_audio_transcription: { model: 'whisper-1' },
-        instructions: `You are Sunshine Pools and Construction's friendly AI receptionist. 
+        instructions: `You are the friendly receptionist for Sunshine Custom Home Builders and Sunshine Luxury Pools.
 
-Be brief, warm, and professional. Your job is to:
-1. Greet callers warmly
-2. Listen to their needs
-3. Collect their name, callback number, and reason for calling
-4. Offer to book a consultation if appropriate
-5. Thank them for calling
-
-Keep responses concise and natural. Don't overwhelm with too much information at once.`
+Rules:
+- Keep replies to 1 short sentence, then STOP.
+- Ask exactly one question at a time, then WAIT for the caller.
+- Do NOT pitch or list services unless asked.
+- Offer to book only when the caller asks for a quote/appointment or after they’ve explained the need.
+- Confirm name and callback number before booking.
+- If the caller gives a time, repeat it back as a question and wait for “yes”.
+- If you didn't catch something, ask a brief follow-up, then wait.`
       }
     });
   });
@@ -164,25 +164,19 @@ Keep responses concise and natural. Don't overwhelm with too much information at
     if (evt.type === 'session.updated') {
       sessionReady = true;
       console.log('[OpenAI] session confirmed');
-      // Send greeting once session is ready
       sendInitialGreeting();
     }
 
-    if (evt.type === 'session.created') {
-      console.log('[OpenAI] session created');
-    }
-
-    // Track response lifecycle
+    // Track response lifecycle (flip busy only on created/completed)
     if (evt.type === 'response.created') {
       inProgress = true;
       console.log('[OpenAI] response started');
     }
 
-    if (evt.type === 'response.done') {
+    if (evt.type === 'response.completed' || evt.type === 'response.done' || evt.type === 'response.output_audio.done') {
       inProgress = false;
       console.log('[OpenAI] response completed');
       conversationStarted = true;
-      // Check if we have buffered audio to process
       tryCommitAndRespond();
     }
 
@@ -190,11 +184,7 @@ Keep responses concise and natural. Don't overwhelm with too much information at
     if ((evt.type === 'response.audio.delta' || evt.type === 'response.output_audio.delta') && streamSid) {
       const audioData = evt.delta || evt.audio;
       if (audioData) {
-        const pkt = { 
-          event: 'media', 
-          streamSid, 
-          media: { payload: audioData } 
-        };
+        const pkt = { event: 'media', streamSid, media: { payload: audioData } };
         try { twilioWS.send(JSON.stringify(pkt)); } catch(e) {
           console.error('[Twilio] Error sending audio:', e.message);
         }
@@ -203,7 +193,7 @@ Keep responses concise and natural. Don't overwhelm with too much information at
 
     if (evt.type === 'error') {
       console.error('[OpenAI ERROR]', JSON.stringify(evt, null, 2));
-      inProgress = false;
+      inProgress = false; // unblock if an error occurs
     }
   });
 
@@ -233,19 +223,17 @@ Keep responses concise and natural. Don't overwhelm with too much information at
         audioQueue.push(data.media.payload);
         framesQueued++;
         bufferDirty = true;
+        lastMediaAt = Date.now();
         frameCountLog++;
-        if (frameCountLog % 50 === 0) {
-          console.log('[Twilio] Total media frames received:', frameCountLog);
-        }
+        if (frameCountLog % 50 === 0) console.log('[Twilio] Total media frames received:', frameCountLog);
       }
       return;
     }
 
     if (data.event === 'stop') {
       console.log('[Twilio] Stream stopped');
-      // Send goodbye if appropriate
+      // Optional: brief sign-off if idle
       if (!inProgress && conversationStarted) {
-        inProgress = true;
         safeSend({
           type: 'conversation.item.create',
           item: {
@@ -254,7 +242,7 @@ Keep responses concise and natural. Don't overwhelm with too much information at
             content: [{ type: 'input_text', text: 'Thanks for calling Sunshine. Have a great day!' }]
           }
         });
-        safeSend({ type: 'response.create', response: { modalities: ['audio', 'text'] } });
+        safeSend({ type: 'response.create', response: { modalities: ['text','audio'] } });
       }
       return;
     }
