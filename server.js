@@ -19,6 +19,8 @@ app.get('/', (_req, res) => res.status(200).send('Sunshine Luxury Pools AI Assis
 // --- TwiML webhook
 const twimlXml = `
 <Response>
+  <Say voice="Polly.Joanna">Good evening, Sunshine. How may I assist you today?</Say>
+  <Pause length="1"/>
   <Connect><Stream url="wss://sunshine-gateway.onrender.com/stream"/></Connect>
 </Response>
 `.trim();
@@ -38,7 +40,6 @@ wss.on('connection', (twilioWS, req) => {
   let streamSid = null;
   let sessionReady = false;
   let inProgress = false;
-  let saidHello = false;
   let conversationStarted = false;
 
   // Audio buffer for VAD mode
@@ -76,29 +77,11 @@ wss.on('connection', (twilioWS, req) => {
     }
   };
 
-  // Initial greeting (no audio buffer needed)
-  const sendInitialGreeting = () => {
-    if (saidHello || !sessionReady) return;
-    saidHello = true;
-    inProgress = true;
-    
-    console.log('[AI] Sending initial greeting');
-    safeSend({
-      type: 'conversation.item.create',
-      item: {
-        type: 'message',
-        role: 'assistant',
-        content: [{
-          type: 'text',
-          text: 'Good evening, Sunshine. How may I assist you today?'
-        }]
-      }
-    });
-    
-    safeSend({ 
-      type: 'response.create',
-      response: { modalities: ['audio', 'text'] }
-    });
+  // Session ready - start listening immediately (TwiML handles greeting)
+  const startConversation = () => {
+    if (conversationStarted || !sessionReady) return;
+    conversationStarted = true;
+    console.log('[AI] Ready to listen to caller');
   };
 
   // With server VAD, we stream audio and OpenAI handles turn detection
@@ -243,17 +226,19 @@ Q: What about maintenance?
 A: The smooth, non-porous surface resists algae, meaning fewer chemicals, less brushing, and lower costs. No resurfacing or acid washing ever required.
 
 ===== CONVERSATION FLOW =====
-1. Greet warmly: "Good [morning/afternoon/evening], Sunshine. How may I assist you today?"
-2. STOP and LISTEN - wait for caller to respond completely
-3. Acknowledge their request briefly
-4. If you can help, answer concisely (1-2 sentences max)
-5. If you can't fully help: "I may be able to answer some of your questions, and if I can't, I'll get one of our specialists to call you back so you're not waiting on hold."
-6. Collect information naturally:
+The caller has already been greeted with: "Good evening, Sunshine. How may I assist you today?"
+
+Your job starts AFTER the greeting:
+1. LISTEN - wait for caller to respond to the greeting
+2. Acknowledge their request briefly
+3. If you can help, answer concisely (1-2 sentences max)
+4. If you can't fully help: "I may be able to answer some of your questions, and if I can't, I'll get one of our specialists to call you back so you're not waiting on hold."
+5. Collect information naturally:
    - Their name
    - Best callback number
    - Their specific interest or question
-7. Offer consultation when appropriate
-8. Confirm next steps
+6. Offer consultation when appropriate
+7. Confirm next steps
 
 ===== HANDLING COMMON REQUESTS =====
 
@@ -265,6 +250,15 @@ Answer briefly if you know, otherwise: "That's a great question. I may be able t
 
 **Pricing:**
 "Pool pricing varies based on size, features, and your specific site. We offer free consultations where we can provide a detailed quote. Can I get your name and number to schedule that?"
+
+**Scheduling Appointments:**
+When someone wants to schedule:
+1. Get their name, phone number, preferred date/time
+2. Confirm the details back to them
+3. Say: "Perfect! I'm scheduling that for you now. You'll receive a text message confirmation shortly with all the details."
+4. Note: You cannot actually schedule - you're collecting information. A team member will follow up to confirm.
+
+**Important:** Always be honest that you're gathering information and a specialist will follow up to confirm the appointment and send calendar details.
 
 **Financing:**
 "Yes, we partner with Vista Fi for flexible financing with quick approvals. I can have a specialist call you to discuss options. What's your name and best number?"
@@ -326,7 +320,7 @@ Remember:
     if (evt.type === 'session.updated' || evt.type === 'session.created') {
       sessionReady = true;
       console.log('[OpenAI] Session ready');
-      sendInitialGreeting();
+      startConversation();
     }
 
     // Response lifecycle tracking
@@ -336,7 +330,6 @@ Remember:
 
     if (evt.type === 'response.done') {
       inProgress = false;
-      conversationStarted = true;
       console.log('[OpenAI] Response complete');
     }
 
@@ -398,26 +391,7 @@ Remember:
 
     if (data.event === 'stop') {
       console.log('[Twilio] Call ended');
-      // Optional goodbye
-      if (!inProgress && conversationStarted) {
-        inProgress = true;
-        safeSend({
-          type: 'conversation.item.create',
-          item: {
-            type: 'message',
-            role: 'assistant',
-            content: [{
-              type: 'text',
-              text: 'Thanks for calling Sunshine Luxury Pools. Have a wonderful day!'
-            }]
-          }
-        });
-        safeSend({ 
-          type: 'response.create', 
-          response: { modalities: ['audio', 'text'] } 
-        });
-      }
-      setTimeout(cleanup, 2000);
+      setTimeout(cleanup, 1000);
       return;
     }
   });
