@@ -1,6 +1,8 @@
 // sunshine-gateway / server.js
 // TwiML webhook + Twilio <Stream> + OpenAI Realtime bridge
-// Fixes: queue ≥100ms before commit, always use modalities ['text','audio'].
+// Fixes:
+//  - commit only when >= 200ms audio buffered
+//  - never call response.create while another response is active
 
 require('dotenv').config();
 const http = require('http');
@@ -52,36 +54,43 @@ wss.on('connection', (twilioWS, req) => {
     try { oaiWS.ping(); } catch {}
   }, 25000);
 
-  // ---- Queue & thresholds ----
-  // Twilio sends 20ms mulaw frames. Commit when we have >= 6 frames (~120ms).
+  // ---- Audio queue & scheduling ----
+  // Twilio sends ~20ms mu-law frames. Commit when we have >= 10 frames (=200ms).
   const FRAME_MS = 20;
-  const MIN_FRAMES_FOR_COMMIT = 6; // 120ms
-  let audioQueue = [];
+  const MIN_FRAMES_FOR_COMMIT = 10; // 200ms
   let framesQueued = 0;
+  let audioQueue = [];
   let openaiReady = false;
   let saidHello = false;
+  let inProgress = false; // true while OpenAI is generating/playing a response
 
   const safeSendToOpenAI = (obj) => {
     if (oaiWS.readyState !== 1) return false; // 1 = OPEN
     try { oaiWS.send(JSON.stringify(obj)); return true; } catch { return false; }
   };
 
-  const flushIfReady = () => {
-    if (!openaiReady) return;
+  const drainQueueAndRespond = () => {
+    if (!openaiReady || inProgress) return;
     if (framesQueued < MIN_FRAMES_FOR_COMMIT) return;
-    // Drain the queue
+
+    // append all frames in the buffer
     while (audioQueue.length) {
       const base64 = audioQueue.shift();
       safeSendToOpenAI({ type: 'input_audio_buffer.append', audio: base64 });
       framesQueued--;
     }
-    // Commit and request a response with audio+text
+
+    // commit and ask for a new response (text+audio)
     safeSendToOpenAI({ type: 'input_audio_buffer.commit' });
-    safeSendToOpenAI({ type: 'response.create', response: { modalities: ['text','audio'] } });
+    inProgress = true; // will be cleared on response.completed
+    safeSendToOpenAI({
+      type: 'response.create',
+      response: { modalities: ['text','audio'] }
+    });
   };
 
-  // Periodic flusher (200ms)
-  const flusher = setInterval(flushIfReady, 200);
+  // Periodic flusher (check every 150ms)
+  const flusher = setInterval(drainQueueAndRespond, 150);
 
   // ---- OpenAI events ----
   oaiWS.on('open', () => {
@@ -99,9 +108,10 @@ wss.on('connection', (twilioWS, req) => {
       }
     });
 
-    // Speak once immediately so the caller hears something
+    // Greet once (and mark inProgress until completed)
     if (!saidHello) {
       saidHello = true;
+      inProgress = true;
       safeSendToOpenAI({
         type: 'response.create',
         response: { modalities: ['text','audio'], instructions: "Hi! Thanks for calling Sunshine. How can I help today?" }
@@ -112,7 +122,17 @@ wss.on('connection', (twilioWS, req) => {
   oaiWS.on('message', (msg) => {
     let evt; try { evt = JSON.parse(msg.toString()); } catch { return; }
 
-    // Forward OpenAI audio chunks to Twilio
+    // Lifecycle markers to control inProgress flag
+    if (evt.type === 'response.created') {
+      inProgress = true;
+    }
+    if (evt.type === 'response.completed') {
+      inProgress = false;
+      // after completion, see if we have more audio to process
+      drainQueueAndRespond();
+    }
+
+    // Forward audio from OpenAI to Twilio
     if (evt.type === 'response.output_audio.delta' && evt.audio && streamSid) {
       const pkt = { event: 'media', streamSid, media: { payload: evt.audio } };
       try { twilioWS.send(JSON.stringify(pkt)); } catch {}
@@ -135,19 +155,22 @@ wss.on('connection', (twilioWS, req) => {
     }
 
     if (data.event === 'media' && data.media?.payload) {
-      // Buffer frames; the flusher will commit once we have enough
+      // Buffer audio; the flusher will commit when enough is buffered and no response is active
       audioQueue.push(data.media.payload);
-      framesQueued++; // 1 frame ≈ 20ms at 8kHz mulaw
+      framesQueued++; // ≈ 20ms per frame
       return;
     }
 
     if (data.event === 'stop') {
       console.log('[Twilio] stop');
-      // Optional polite sign-off
-      safeSendToOpenAI({
-        type: 'response.create',
-        response: { modalities: ['text','audio'], instructions: "Thanks for calling Sunshine. We'll follow up shortly. Goodbye!" }
-      });
+      // optional sign-off only if nothing active
+      if (!inProgress) {
+        inProgress = true;
+        safeSendToOpenAI({
+          type: 'response.create',
+          response: { modalities: ['text','audio'], instructions: "Thanks for calling Sunshine. We'll follow up shortly. Goodbye!" }
+        });
+      }
       return;
     }
   });
