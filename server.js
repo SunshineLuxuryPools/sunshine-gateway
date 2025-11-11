@@ -91,7 +91,7 @@ wss.on('connection', (twilioWS, req) => {
         type: 'message',
         role: 'assistant',
         content: [{
-          type: 'input_text',
+          type: 'text',
           text: 'Good evening, Sunshine. How may I assist you today?'
         }]
       }
@@ -412,7 +412,7 @@ Remember:
             type: 'message',
             role: 'assistant',
             content: [{
-              type: 'input_text',
+              type: 'text',
               text: 'Thanks for calling Sunshine Luxury Pools. Have a wonderful day!'
             }]
           }
