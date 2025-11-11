@@ -98,7 +98,7 @@ wss.on('connection', (twilioWS, req) => {
     // Then create response to generate the audio
     safeSend({ 
       type: 'response.create',
-      response: { modalities: ['audio'] }
+      response: { modalities: ['audio', 'text'] }
     });
   };
 
@@ -254,7 +254,7 @@ Keep responses concise and natural. Don't overwhelm with too much information at
             content: [{ type: 'input_text', text: 'Thanks for calling Sunshine. Have a great day!' }]
           }
         });
-        safeSend({ type: 'response.create', response: { modalities: ['audio'] } });
+        safeSend({ type: 'response.create', response: { modalities: ['audio', 'text'] } });
       }
       return;
     }
