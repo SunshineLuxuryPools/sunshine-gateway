@@ -1,6 +1,5 @@
 // sunshine-gateway / server.js
-// Enhanced AI Phone Assistant for Luxury Pools (Explore Industries Dealer)
-// Twilio <Stream> ↔ OpenAI Realtime with comprehensive pool knowledge
+// Enhanced AI Phone Assistant for Luxury Pools
 
 require('dotenv').config();
 const http = require('http');
@@ -11,7 +10,6 @@ const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
-// --- Basic logs + health
 app.use((req, _res, next) => { console.log('[HTTP]', req.method, req.url); next(); });
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 app.get('/', (_req, res) => res.status(200).send('Sunshine Luxury Pools AI Assistant'));
@@ -19,7 +17,7 @@ app.get('/', (_req, res) => res.status(200).send('Sunshine Luxury Pools AI Assis
 // --- TwiML webhook
 const twimlXml = `
 <Response>
-  <Say voice="Polly.Joanna">Good evening, Sunshine. How may I assist you today?</Say>
+  <Say voice="Polly.Joanna">Good evening, <break time="300ms"/> SUNSHINE. <break time="500ms"/> Emma speaking. How may I assist you today?</Say>
   <Pause length="1"/>
   <Connect><Stream url="wss://sunshine-gateway.onrender.com/stream"/></Connect>
 </Response>
@@ -36,17 +34,14 @@ const wss = new WebSocketServer({ server, path: '/stream' });
 wss.on('connection', (twilioWS, req) => {
   console.log('[Twilio] WS connected from', req.socket.remoteAddress);
 
-  // State management
   let streamSid = null;
   let sessionReady = false;
   let inProgress = false;
   let conversationStarted = false;
 
-  // Audio buffer for VAD mode
   const audioQueue = [];
   let frameCount = 0;
 
-  // --- OpenAI Realtime Connection
   const OPENAI_RT_URL = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12-17';
   const oaiWS = new ClientWS(OPENAI_RT_URL, {
     headers: {
@@ -77,14 +72,12 @@ wss.on('connection', (twilioWS, req) => {
     }
   };
 
-  // Session ready - start listening immediately (TwiML handles greeting)
   const startConversation = () => {
     if (conversationStarted || !sessionReady) return;
     conversationStarted = true;
     console.log('[AI] Ready to listen to caller');
   };
 
-  // With server VAD, we stream audio and OpenAI handles turn detection
   const sendAudioToOpenAI = () => {
     if (!sessionReady || !conversationStarted) return;
     
@@ -94,41 +87,39 @@ wss.on('connection', (twilioWS, req) => {
     }
   };
 
-  // Send audio continuously
   const audioSender = setInterval(sendAudioToOpenAI, 100);
 
-  // ===== OpenAI Event Handlers =====
   oaiWS.on('open', () => {
     console.log('[OpenAI] Connected');
     
-    // Configure session with luxury pool knowledge
     safeSend({
       type: 'session.update',
       session: {
         input_audio_format: 'g711_ulaw',
         output_audio_format: 'g711_ulaw',
         
-        // Voice Activity Detection - AI listens and can be interrupted
         turn_detection: {
           type: 'server_vad',
           threshold: 0.5,
           prefix_padding_ms: 300,
-          silence_duration_ms: 600  // Reduced to 600ms for faster responses
+          silence_duration_ms: 600
         },
         
-        // Voice configuration - shimmer is warmer and more conversational
         voice: 'shimmer',
-        
-        temperature: 0.9,  // More natural and less scripted
-        
-        max_response_output_tokens: 150,  // Keep responses shorter
+        temperature: 0.9,
+        max_response_output_tokens: 150,
         
         input_audio_transcription: { 
           model: 'whisper-1' 
         },
         
-        // ===== AI ASSISTANT INSTRUCTIONS =====
-        instructions: `You're the receptionist at Sunshine Luxury Pools. Talk like a real person - natural, warm, conversational.
+        instructions: `You're Emma, the receptionist at Sunshine Luxury Pools. 
+
+IMPORTANT: The caller has ALREADY been greeted with "Good evening, SUNSHINE. Emma speaking. How may I assist you today?"
+
+Your first response should react to what the CALLER says, not repeat the greeting.
+
+Talk like a real person - natural, warm, conversational.
 
 BE NATURAL:
 - Use contractions (I'm, we're, that's, you'll)
@@ -198,6 +189,91 @@ Remember: You're having a conversation, not reading a script. Be real.`
     });
   });
 
+  oaiWS.on('message', (msg) => {
+    let evt;
+    try { evt = JSON.parse(msg.toString()); } catch { return; }
+
+    if (evt.type && 
+        evt.type !== 'response.audio.delta' && 
+        evt.type !== 'response.output_audio.delta' &&
+        evt.type !== 'input_audio_buffer.speech_started' &&
+        evt.type !== 'input_audio_buffer.speech_stopped') {
+      console.log('[OpenAI]', evt.type);
+    }
+
+    if (evt.type === 'session.updated' || evt.type === 'session.created') {
+      sessionReady = true;
+      console.log('[OpenAI] Session ready');
+      startConversation();
+    }
+
+    if (evt.type === 'response.created') {
+      inProgress = true;
+    }
+
+    if (evt.type === 'response.done') {
+      inProgress = false;
+      console.log('[OpenAI] Response complete');
+    }
+
+    if ((evt.type === 'response.audio.delta' || evt.type === 'response.output_audio.delta') && streamSid) {
+      const audioData = evt.delta || evt.audio;
+      if (audioData) {
+        try {
+          twilioWS.send(JSON.stringify({
+            event: 'media',
+            streamSid,
+            media: { payload: audioData }
+          }));
+        } catch (e) {
+          console.error('[Twilio] Send error:', e.message);
+        }
+      }
+    }
+
+    if (evt.type === 'error') {
+      console.error('[OpenAI ERROR]', JSON.stringify(evt.error, null, 2));
+      inProgress = false;
+    }
+  });
+
+  oaiWS.on('error', (e) => {
+    console.error('[OpenAI] Connection error:', e?.message);
+  });
+
+  oaiWS.on('close', (code, reason) => {
+    console.log('[OpenAI] Disconnected. Code:', code);
+  });
+
+  twilioWS.on('message', (buf) => {
+    let data;
+    try { data = JSON.parse(buf.toString()); } catch { return; }
+
+    if (data.event === 'start') {
+      streamSid = data.start?.streamSid || null;
+      console.log('[Twilio] Call started. Stream SID:', streamSid);
+      return;
+    }
+
+    if (data.event === 'media' && data.media?.payload) {
+      if (conversationStarted) {
+        audioQueue.push(data.media.payload);
+        frameCount++;
+        
+        if (frameCount % 100 === 0) {
+          console.log('[Twilio] Audio frames received:', frameCount);
+        }
+      }
+      return;
+    }
+
+    if (data.event === 'stop') {
+      console.log('[Twilio] Call ended');
+      setTimeout(cleanup, 1000);
+      return;
+    }
+  });
+
   twilioWS.on('close', () => {
     console.log('[Twilio] Connection closed');
     cleanup();
@@ -212,8 +288,7 @@ Remember: You're having a conversation, not reading a script. Be real.`
 const port = process.env.PORT || 8080;
 server.listen(port, () => {
   console.log('==============================================');
-  console.log('🌞 Sunshine Luxury Pools AI Assistant');
-  console.log('🏊 Explore Industries Authorized Dealer');
+  console.log('🌞 Sunshine Luxury Pools - Emma AI');
   console.log(`📞 Listening on port ${port}`);
   console.log('==============================================');
 });
