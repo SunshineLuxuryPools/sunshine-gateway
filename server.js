@@ -1,15 +1,29 @@
-// sunshine-gateway / server.js (echo test)
+// sunshine-gateway / server.js (echo test + TwiML webhook)
 require('dotenv').config();
 const http = require('http');
 const express = require('express');
 const { WebSocketServer } = require('ws');
 
 const app = express();
+app.use(express.urlencoded({ extended: false }));
 
 // HTTP logging + health
 app.use((req, _res, next) => { console.log('[HTTP]', req.method, req.url); next(); });
 app.get('/health', (_, res) => res.status(200).send('ok'));
 app.get('/',     (_, res) => res.status(200).send('sunshine-gateway up'));
+
+// TwiML webhook for inbound calls
+app.post('/twiml', (req, res) => {
+  console.log('[HTTP] POST /twiml');
+  res.type('text/xml').send(`
+    <Response>
+      <Say voice="alice">Good evening, Sunshine. Connecting you now.</Say>
+      <Connect>
+        <Stream url="wss://sunshine-gateway.onrender.com/stream"/>
+      </Connect>
+    </Response>
+  `.trim());
+});
 
 const server = http.createServer(app);
 server.on('upgrade', (req) => { console.log('[UPGRADE] request for', req.url); });
@@ -37,7 +51,6 @@ wss.on('connection', (ws, req) => {
 
     if (d.event === 'media') {
       // Echo the caller audio back to them (μ-law 8k base64)
-      // NOTE: This is for testing 2-way only; expect a slight delay/robotic sound.
       if (streamSid && d.media?.payload) {
         const out = {
           event: 'media',
