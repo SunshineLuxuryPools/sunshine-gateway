@@ -1,6 +1,7 @@
 // sunshine-gateway / server.js
 // TwiML webhook + Twilio <Stream> + OpenAI Realtime bridge
-// Uses 'g711_ulaw' formats; buffers >=200ms; prevents overlapping responses.
+// g711_ulaw formats; buffers >=200ms; prevents overlapping responses
+// EXTRA: loud OpenAI event logs + guaranteed hello (retry) + media frame counter
 
 require('dotenv').config();
 const http = require('http');
@@ -41,7 +42,7 @@ wss.on('connection', (twilioWS, req) => {
   const OPENAI_RT_URL = 'wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-12';
   const oaiWS = new ClientWS(OPENAI_RT_URL, {
     headers: {
-      'Authorization': `Bearer ${process.env.OPENAI_API_KEY || ''}`,
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY || ''}`,
       'OpenAI-Beta': 'realtime=v1'
     }
   });
@@ -59,9 +60,10 @@ wss.on('connection', (twilioWS, req) => {
   let openaiReady = false;
   let saidHello = false;
   let inProgress = false;
+  let lastHelloAt = 0;
 
   const safeSendToOpenAI = (obj) => {
-    if (oaiWS.readyState !== 1) return false; // 1 = OPEN
+    if (oaiWS.readyState !== 1) return false; // OPEN
     try { oaiWS.send(JSON.stringify(obj)); return true; } catch { return false; }
   };
 
@@ -69,13 +71,14 @@ wss.on('connection', (twilioWS, req) => {
     if (!openaiReady || inProgress) return;
     if (framesQueued < MIN_FRAMES_FOR_COMMIT) return;
 
+    console.log('[Bridge] committing', framesQueued, 'frames (~', framesQueued * 20, 'ms )');
     while (audioQueue.length) {
       const base64 = audioQueue.shift();
       safeSendToOpenAI({ type: 'input_audio_buffer.append', audio: base64 });
       framesQueued--;
     }
     safeSendToOpenAI({ type: 'input_audio_buffer.commit' });
-    inProgress = true; // will be cleared on response.completed
+    inProgress = true; // cleared by response.completed
     safeSendToOpenAI({ type: 'response.create', response: { modalities: ['text','audio'] } });
   };
 
@@ -84,9 +87,9 @@ wss.on('connection', (twilioWS, req) => {
   // ----- OpenAI events -----
   oaiWS.on('open', () => {
     console.log('[OpenAI] connected');
-
     openaiReady = true;
-    // IMPORTANT: formats must be strings ('g711_ulaw' | 'g711_alaw' | 'pcm16')
+
+    // IMPORTANT: formats are strings
     safeSendToOpenAI({
       type: 'session.update',
       session: {
@@ -97,20 +100,36 @@ wss.on('connection', (twilioWS, req) => {
       }
     });
 
-    if (!saidHello) {
-      saidHello = true;
-      inProgress = true;
+    // Guaranteed greeting (don’t set inProgress until we get created)
+    const sayHello = () => {
+      console.log('[OpenAI] sending hello');
+      lastHelloAt = Date.now();
       safeSendToOpenAI({
         type: 'response.create',
         response: { modalities: ['text','audio'], instructions: "Hi! Thanks for calling Sunshine. How can I help today?" }
       });
-    }
+    };
+    if (!saidHello) { saidHello = true; sayHello(); }
+
+    // Retry hello once if nothing starts within 800ms
+    setTimeout(() => {
+      if (!inProgress && Date.now() - lastHelloAt >= 700) {
+        console.log('[OpenAI] retry hello');
+        sayHello();
+      }
+    }, 800);
   });
 
   oaiWS.on('message', (msg) => {
     let evt; try { evt = JSON.parse(msg.toString()); } catch { return; }
+    // Loud event logging
+    if (evt.type && evt.type !== 'response.output_audio.delta') {
+      console.log('[OpenAI EVT]', evt.type);
+    }
 
-    if (evt.type === 'response.created') inProgress = true;
+    if (evt.type === 'response.created') {
+      inProgress = true;
+    }
     if (evt.type === 'response.completed') {
       inProgress = false;
       drainQueueAndRespond();
@@ -128,6 +147,7 @@ wss.on('connection', (twilioWS, req) => {
   oaiWS.on('close', () => console.log('[OpenAI] closed'));
 
   // ----- Twilio -> OpenAI -----
+  let frameCountLog = 0;
   twilioWS.on('message', (buf) => {
     let data; try { data = JSON.parse(buf.toString()); } catch { return; }
 
@@ -140,6 +160,10 @@ wss.on('connection', (twilioWS, req) => {
     if (data.event === 'media' && data.media?.payload) {
       audioQueue.push(data.media.payload);
       framesQueued++;
+      frameCountLog++;
+      if (frameCountLog % 25 === 0) {
+        console.log('[Twilio] media frames queued:', frameCountLog);
+      }
       return;
     }
 
