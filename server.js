@@ -1,5 +1,7 @@
 // sunshine-gateway / server.js
-// TwiML webhook + Twilio <Stream> + OpenAI Realtime bridge (with queue/throttle)
+// TwiML webhook + Twilio <Stream> + OpenAI Realtime bridge
+// Fixes: queue ≥100ms before commit, always use modalities ['text','audio'].
+
 require('dotenv').config();
 const http = require('http');
 const express = require('express');
@@ -9,7 +11,7 @@ const app = express();
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
-// ---------- Basic logs + health ----------
+// ---------- Logs + health ----------
 app.use((req, _res, next) => { console.log('[HTTP]', req.method, req.url); next(); });
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 app.get('/', (_req, res) => res.status(200).send('sunshine-gateway up'));
@@ -21,11 +23,10 @@ const twimlXml = `
   <Connect><Stream url="wss://sunshine-gateway.onrender.com/stream"/></Connect>
 </Response>
 `.trim();
-
 app.get('/twiml', (_req, res) => { console.log('[TwiML] GET /twiml');  res.type('text/xml').send(twimlXml); });
 app.post('/twiml', (_req, res) => { console.log('[TwiML] POST /twiml'); res.type('text/xml').send(twimlXml); });
 
-// ---------- HTTP server + upgrade logs ----------
+// ---------- HTTP server + WS upgrade logs ----------
 const server = http.createServer(app);
 server.on('upgrade', (req) => console.log('[UPGRADE] request for', req.url));
 
@@ -51,39 +52,36 @@ wss.on('connection', (twilioWS, req) => {
     try { oaiWS.ping(); } catch {}
   }, 25000);
 
-  // ---- Queue & throttle so we don't send before OpenAI is ready ----
+  // ---- Queue & thresholds ----
+  // Twilio sends 20ms mulaw frames. Commit when we have >= 6 frames (~120ms).
+  const FRAME_MS = 20;
+  const MIN_FRAMES_FOR_COMMIT = 6; // 120ms
+  let audioQueue = [];
+  let framesQueued = 0;
   let openaiReady = false;
-  const audioQueue = [];
-  let flushTimer = null;
-  const FLUSH_MS = 250;          // how often we commit & request response
   let saidHello = false;
 
   const safeSendToOpenAI = (obj) => {
-    if (!oaiWS || oaiWS.readyState !== 1) return false; // 1 = OPEN
+    if (oaiWS.readyState !== 1) return false; // 1 = OPEN
     try { oaiWS.send(JSON.stringify(obj)); return true; } catch { return false; }
   };
 
-  const flushQueue = () => {
-    if (!openaiReady || oaiWS.readyState !== 1) return;
-    if (audioQueue.length === 0) return;
-    // append all queued audio frames
+  const flushIfReady = () => {
+    if (!openaiReady) return;
+    if (framesQueued < MIN_FRAMES_FOR_COMMIT) return;
+    // Drain the queue
     while (audioQueue.length) {
       const base64 = audioQueue.shift();
       safeSendToOpenAI({ type: 'input_audio_buffer.append', audio: base64 });
+      framesQueued--;
     }
-    // commit and request audio response
+    // Commit and request a response with audio+text
     safeSendToOpenAI({ type: 'input_audio_buffer.commit' });
-    safeSendToOpenAI({ type: 'response.create', response: { modalities: ['audio'] } });
+    safeSendToOpenAI({ type: 'response.create', response: { modalities: ['text','audio'] } });
   };
 
-  const startFlusher = () => {
-    if (flushTimer) return;
-    flushTimer = setInterval(flushQueue, FLUSH_MS);
-  };
-
-  const stopFlusher = () => {
-    if (flushTimer) { clearInterval(flushTimer); flushTimer = null; }
-  };
+  // Periodic flusher (200ms)
+  const flusher = setInterval(flushIfReady, 200);
 
   // ---- OpenAI events ----
   oaiWS.on('open', () => {
@@ -101,7 +99,7 @@ wss.on('connection', (twilioWS, req) => {
       }
     });
 
-    // Say hello immediately once, so caller hears something
+    // Speak once immediately so the caller hears something
     if (!saidHello) {
       saidHello = true;
       safeSendToOpenAI({
@@ -109,22 +107,22 @@ wss.on('connection', (twilioWS, req) => {
         response: { modalities: ['text','audio'], instructions: "Hi! Thanks for calling Sunshine. How can I help today?" }
       });
     }
-
-    startFlusher();
   });
 
   oaiWS.on('message', (msg) => {
     let evt; try { evt = JSON.parse(msg.toString()); } catch { return; }
+
     // Forward OpenAI audio chunks to Twilio
     if (evt.type === 'response.output_audio.delta' && evt.audio && streamSid) {
       const pkt = { event: 'media', streamSid, media: { payload: evt.audio } };
       try { twilioWS.send(JSON.stringify(pkt)); } catch {}
     }
+
     if (evt.type === 'error') console.error('[OpenAI ERROR]', evt);
   });
 
   oaiWS.on('error', (e) => console.error('[OpenAI] error', e?.message || e));
-  oaiWS.on('close', () => { console.log('[OpenAI] closed'); stopFlusher(); });
+  oaiWS.on('close', () => console.log('[OpenAI] closed'));
 
   // ---- Twilio -> OpenAI ----
   twilioWS.on('message', (buf) => {
@@ -137,35 +135,32 @@ wss.on('connection', (twilioWS, req) => {
     }
 
     if (data.event === 'media' && data.media?.payload) {
-      // buffer audio; flusher will deliver when OpenAI is OPEN
+      // Buffer frames; the flusher will commit once we have enough
       audioQueue.push(data.media.payload);
-      startFlusher();
+      framesQueued++; // 1 frame ≈ 20ms at 8kHz mulaw
       return;
     }
 
     if (data.event === 'stop') {
       console.log('[Twilio] stop');
-      // polite goodbye
+      // Optional polite sign-off
       safeSendToOpenAI({
         type: 'response.create',
-        response: { modalities: ['audio'], instructions: "Thanks for calling Sunshine. We'll follow up shortly. Goodbye!" }
+        response: { modalities: ['text','audio'], instructions: "Thanks for calling Sunshine. We'll follow up shortly. Goodbye!" }
       });
       return;
     }
   });
 
-  twilioWS.on('close', () => {
-    console.log('[Twilio] WS closed');
-    stopFlusher();
+  const cleanup = () => {
+    clearInterval(flusher);
     clearInterval(keepAlive);
     try { oaiWS.close(); } catch {}
-  });
+    try { twilioWS.close(); } catch {}
+  };
 
-  twilioWS.on('error', () => {
-    stopFlusher();
-    clearInterval(keepAlive);
-    try { oaiWS.close(); } catch {}
-  });
+  twilioWS.on('close', () => { console.log('[Twilio] WS closed'); cleanup(); });
+  twilioWS.on('error', cleanup);
 });
 
 // ---------- Start server ----------
